@@ -1,0 +1,47 @@
+#############################################################
+# Runtime environment snapshot (Python 3.10.5) – core deps  #
+# Exact versions currently installed AND imported/needed     #
+# by the image search FastAPI + DINOv2 feature pipeline.    #
+# (Classical color/texture features run with fallbacks.)     #
+#############################################################
+
+# --- Core DL stack (GPU build already installed) ---
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0  # not directly used, but bundled with torch install
+
+# NOTE: timm is REQUIRED to load DINOv2 automatically, but is NOT installed.
+# Install (compatible) e.g.: timm==1.0.9  (add below if you install it)
+
+# --- FastAPI server ---
+fastapi==0.116.1
+starlette==0.47.3   # fastapi dependency (pinned for reproducibility)
+uvicorn==0.35.0
+python-multipart==0.0.20
+h11==0.16.0          # uvicorn dependency (explicit pin helps reproducibility)
+
+# --- Numerical & imaging ---
+numpy==2.2.6
+Pillow==11.2.1
+opencv-python==4.11.0.86
+scikit-image==0.25.2
+
+# --- Similarity / indexing ---
+faiss-cpu==1.12.0
+
+# --- Utility ---
+tqdm==4.67.1
+pydantic==2.11.7
+pydantic-core==2.33.2
+typing_extensions==4.15.0  # pydantic / fastapi typing support
+
+#############################################################
+# Optional / Missing (uncomment to enable extra functionality)
+#############################################################
+# timm==1.0.9          # Needed for DINOv2 backbone auto-download
+# scikit-learn==1.5.2  # Enables KMeans for dominant_colors (else fallback)
+
+#############################################################
+# Python version (for reference)
+# python==3.10.5  # Do NOT install via pip; manage via pyenv/installer
+#############################################################
