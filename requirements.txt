@@ -35,6 +35,9 @@ pydantic==2.11.7
 pydantic-core==2.33.2
 typing_extensions==4.15.0  # pydantic / fastapi typing support
 
+# Memory tracking (optional but recommended for profiling)
+psutil==5.9.5
+
 #############################################################
 # Optional / Missing (uncomment to enable extra functionality)
 #############################################################

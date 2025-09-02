@@ -5,7 +5,7 @@ import shutil
 import uuid
 import time
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Form, Request
 from fastapi.responses import JSONResponse
 
 from contextlib import asynccontextmanager
@@ -15,6 +15,12 @@ from torchvision import transforms
 from PIL import Image
 import json
 import cv2
+try:
+    import psutil
+    _PSUTIL_AVAILABLE = True
+except Exception:
+    psutil = None
+    _PSUTIL_AVAILABLE = False
 
 try:
     import faiss  # type: ignore
@@ -68,6 +74,7 @@ IMAGE_PATHS: List[str] = []
 IMAGE_IDS: List[str] = []
 IMAGES_DIR = None
 ERROR_MSG = None
+STARTUP_MEM: Dict[str, float] = {}
 
 
 USE_AQE = os.environ.get('USE_AQE','1') == '1'
@@ -79,6 +86,39 @@ RETRIEVAL_MODE = 'v2'
 GEOM_WEIGHT = float(os.environ.get('GEOM_WEIGHT','0.5'))
 
 DESCR_CACHE: Dict[str, Tuple[List[cv2.KeyPoint], np.ndarray, bool]] = {}
+
+
+def _format_mem(bytes_val: int) -> str:
+    try:
+        return f"{bytes_val / 1024 / 1024:.1f} MB"
+    except Exception:
+        return f"{bytes_val} B"
+
+
+def get_memory_info() -> Dict[str, float]:
+    """Return memory usage info for the current process.
+
+    Returns a dict with rss (bytes), vms (bytes) and percent (float).
+    """
+    pid = os.getpid()
+    if _PSUTIL_AVAILABLE:
+        p = psutil.Process(pid)
+        mi = p.memory_info()
+        return {"rss": float(mi.rss), "vms": float(getattr(mi, 'vms', 0)), "percent": float(p.memory_percent())}
+    else:
+        # Best-effort fallback using resource (Unix) or zeros on Windows without psutil
+        try:
+            import resource  # type: ignore
+            rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            # ru_maxrss is kilobytes on many Unixes; convert to bytes
+            return {"rss": float(rss) * 1024.0, "vms": 0.0, "percent": 0.0}
+        except Exception:
+            return {"rss": 0.0, "vms": 0.0, "percent": 0.0}
+
+
+def log_memory(label: str = "") -> None:
+    mi = get_memory_info()
+    print(f"[MEM] {label} RSS={_format_mem(int(mi.get('rss',0)))} VMS={_format_mem(int(mi.get('vms',0)))} Pct={mi.get('percent',0):.2f}%")
 
 
 
@@ -310,9 +350,52 @@ def search(query_embed: np.ndarray, top_k: int = 8):
     if FAISS_INDEX is not None:
         sims, idxs = FAISS_INDEX.search(query_embed.reshape(1, -1).astype(np.float32), top_k * 5)
         return idxs[0], sims[0]
-    sims = EMBED_V2 @ query_embed
-    order = np.argsort(-sims)[: top_k * 5]
-    return order, sims[order]
+    # If EMBED_V2 is a memmap or very large, avoid creating full sims in memory
+    try:
+        is_memmap = hasattr(EMBED_V2, 'filename') or (hasattr(EMBED_V2, 'mode') and getattr(EMBED_V2, 'mode') == 'r')
+    except Exception:
+        is_memmap = False
+
+    # threshold in rows above which we prefer chunking
+    rows_threshold = int(os.environ.get('EMBED_CHUNK_ROWS', '200000'))
+    use_chunk = is_memmap or (hasattr(EMBED_V2, 'shape') and EMBED_V2.shape[0] > rows_threshold)
+    if use_chunk:
+        return _topk_by_chunks(EMBED_V2, query_embed, top_k * 5)
+    else:
+        sims = EMBED_V2 @ query_embed
+        order = np.argsort(-sims)[: top_k * 5]
+        return order, sims[order]
+
+
+def _topk_by_chunks(emb_matrix, query_vec: np.ndarray, k: int, chunk_size: int = 8192):
+    """Compute top-k indices and scores by processing the embedding matrix in chunks.
+
+    emb_matrix may be a memmap or an ndarray. Returns (indices, scores) for top-k.
+    """
+    import heapq
+    n_rows = int(emb_matrix.shape[0])
+    best = []  # min-heap of (score, idx)
+    q = query_vec.astype(np.float32)
+    for start in range(0, n_rows, chunk_size):
+        stop = min(n_rows, start + chunk_size)
+        try:
+            block = np.asarray(emb_matrix[start:stop], dtype=np.float32)
+        except Exception:
+            block = emb_matrix[start:stop].astype(np.float32)
+        # compute block scores
+        block_scores = block @ q
+        for i, s in enumerate(block_scores):
+            if len(best) < k:
+                heapq.heappush(best, (float(s), start + i))
+            else:
+                if s > best[0][0]:
+                    heapq.heapreplace(best, (float(s), start + i))
+    if not best:
+        return np.array([], dtype=int), np.array([], dtype=np.float32)
+    best_sorted = sorted(best, key=lambda x: -x[0])
+    scores = np.array([b[0] for b in best_sorted], dtype=np.float32)
+    idxs = np.array([b[1] for b in best_sorted], dtype=int)
+    return idxs, scores
 
 def compute_fusion_similarities(query_embed: np.ndarray, candidate_pool: np.ndarray = None, comp_weights: Dict[str, float] = None):
     """Compute fusion similarities for either the full index or a candidate pool."""
@@ -320,17 +403,37 @@ def compute_fusion_similarities(query_embed: np.ndarray, candidate_pool: np.ndar
         comp_weights = {}
     
     if candidate_pool is None:
-        sims = np.zeros(EMBED_V2.shape[0], dtype=np.float32)
+        n = EMBED_V2.shape[0]
+        sims = np.zeros(n, dtype=np.float32)
         total_w = 0.0
-        for comp, rng in SPANS_V2.items():
-            w = float(comp_weights.get(comp, 0.0))
-            if w == 0.0:
-                continue
-            start, stop = int(rng[0]), int(rng[1])
-            q_sub = query_embed[start:stop]
-            emb_sub = EMBED_V2[:, start:stop]
-            sims += w * (emb_sub @ q_sub)
-            total_w += w
+        # decide whether to chunk rows
+        is_memmap = hasattr(EMBED_V2, 'filename') or (hasattr(EMBED_V2, 'mode') and getattr(EMBED_V2, 'mode') == 'r')
+        rows_threshold = int(os.environ.get('EMBED_CHUNK_ROWS', '200000'))
+        use_chunk = is_memmap or n > rows_threshold
+        if use_chunk:
+            # chunk across rows
+            chunk_size = int(os.environ.get('EMBED_CHUNK_SIZE', '8192'))
+            for comp, rng in SPANS_V2.items():
+                w = float(comp_weights.get(comp, 0.0))
+                if w == 0.0:
+                    continue
+                start, stop = int(rng[0]), int(rng[1])
+                q_sub = query_embed[start:stop]
+                total_w += w
+                for rs in range(0, n, chunk_size):
+                    re = min(n, rs + chunk_size)
+                    block = np.asarray(EMBED_V2[rs:re, start:stop], dtype=np.float32)
+                    sims[rs:re] += w * (block @ q_sub)
+        else:
+            for comp, rng in SPANS_V2.items():
+                w = float(comp_weights.get(comp, 0.0))
+                if w == 0.0:
+                    continue
+                start, stop = int(rng[0]), int(rng[1])
+                q_sub = query_embed[start:stop]
+                emb_sub = EMBED_V2[:, start:stop]
+                sims += w * (emb_sub @ q_sub)
+                total_w += w
         if total_w > 0:
             sims /= total_w
         cand_idx = np.argsort(-sims)
@@ -379,7 +482,18 @@ def load_index():
                     emb_path = INDEX_V2_JSON.parent / emb_path
                 if not emb_path.exists():
                     raise FileNotFoundError(f"Embedding file not found: {emb_path}")
-                EMBED_V2 = np.load(str(emb_path)).astype(np.float32)
+                # Prefer memory-mapped load to reduce resident memory if requested
+                use_mmap = os.environ.get('EMBED_MMAP', '1') == '1'
+                if use_mmap:
+                    try:
+                        EMBED_V2 = np.load(str(emb_path), mmap_mode='r')
+                        print(f"[INFO] Loaded embeddings as memmap from {emb_path}")
+                    except Exception:
+                        # fallback to full load
+                        EMBED_V2 = np.load(str(emb_path)).astype(np.float32)
+                        print(f"[WARN] Failed memmap, loaded embeddings into memory from {emb_path}")
+                else:
+                    EMBED_V2 = np.load(str(emb_path)).astype(np.float32)
             elif 'embedding' in data:
                 EMBED_V2 = np.array(data['embedding'], dtype=np.float32)
             else:
@@ -416,12 +530,34 @@ def load_model():
 async def lifespan(app: FastAPI):
     """Load index and model on startup"""
     try:
+        log_memory("startup: before load_index")
         load_index()
+        log_memory("startup: after load_index")
         load_model()
+        log_memory("startup: after load_model")
+        # Record baseline memory snapshot after models/index loaded
+        try:
+            global STARTUP_MEM
+            STARTUP_MEM = get_memory_info()
+            log_memory("startup: baseline recorded")
+        except Exception:
+            pass
         print("[INFO] FastAPI startup complete")
     except Exception as e:
         print(f"[ERROR] Startup failed: {e}")
-    yield
+    try:
+        yield
+    finally:
+        # shutdown: persist and report
+        try:
+            log_memory("shutdown: before persist")
+            try:
+                _persist_index_changes()
+            except Exception:
+                pass
+            log_memory("shutdown: after persist")
+        except Exception:
+            pass
 
 
 
@@ -442,12 +578,49 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def memory_middleware(request: Request, call_next):
+    """Log memory before and after each request and print delta."""
+    try:
+        log_memory(f"request: start {request.method} {request.url.path}")
+        before = get_memory_info()
+    except Exception:
+        before = {"rss": 0.0}
+    response = await call_next(request)
+    try:
+        after = get_memory_info()
+        delta = after.get('rss', 0.0) - before.get('rss', 0.0)
+        print(f"[MEM] request: end {request.method} {request.url.path} delta={_format_mem(int(delta))}")
+    except Exception:
+        pass
+    return response
+
+
+@app.get("/api/memory")
+def api_memory_info() -> Dict[str, object]:
+    """Return memory snapshot and delta vs startup baseline (if available)."""
+    mi = get_memory_info()
+    baseline = STARTUP_MEM if isinstance(STARTUP_MEM, dict) else {}
+    delta = float(mi.get('rss', 0.0) - baseline.get('rss', 0.0)) if baseline else 0.0
+    return {
+        "memory": mi,
+        "rss_human": _format_mem(int(mi.get('rss', 0))),
+        "vms_human": _format_mem(int(mi.get('vms', 0))),
+        "percent": mi.get('percent', 0.0),
+        "baseline_rss": baseline.get('rss', 0.0),
+        "baseline_rss_human": _format_mem(int(baseline.get('rss', 0))) if baseline else "0 B",
+        "delta_rss": delta,
+        "delta_rss_human": _format_mem(int(delta))
+    }
+
+
 
 def add_image_to_index(image_path: Path, object_id: str = None) -> bool:
     """Add a single image to the existing index without rebuilding."""
     global EMBED_V2, FAISS_INDEX, IMAGE_PATHS, IMAGE_IDS
     
     try:
+        log_memory("add_image_to_index: start")
         if EMBED_V2 is None or BACKBONE_V2 is None:
             raise RuntimeError('Index not loaded')
         
@@ -496,6 +669,7 @@ def add_image_to_index(image_path: Path, object_id: str = None) -> bool:
         # Add to FAISS index if available
         if FAISS_INDEX is not None:
             FAISS_INDEX.add(new_embed.reshape(1, -1).astype(np.float32))
+            log_memory("add_image_to_index: after faiss.add")
         
 
 
@@ -545,6 +719,7 @@ def add_image_to_index(image_path: Path, object_id: str = None) -> bool:
         # Update FAISS index file if available
         if FAISS_INDEX is not None and INDEX_V2_FAISS.exists():
             faiss.write_index(FAISS_INDEX, str(INDEX_V2_FAISS))
+        log_memory("add_image_to_index: done")
         
         print(f"[INFO] Added image to index: {image_path.name} with ObjectId: {object_id}")
         return True
@@ -560,8 +735,10 @@ def process_search(save_path: Path, color_filter: str = None, top_k: int = 8):
         raise RuntimeError('V2 index or backbone not available. Rebuild index with DINOv2.')
 
     # Extract all local + global features
+    log_memory("process_search: before extract_all")
     img = Image.open(save_path).convert('RGB')
     feat_dict = extract_all(BACKBONE_V2, img)
+    log_memory("process_search: after extract_all")
     full_q, local_spans = concat_and_normalize(feat_dict)
 
     # Align query embedding dimension with index (mirror UI logic)
@@ -670,10 +847,12 @@ def process_search(save_path: Path, color_filter: str = None, top_k: int = 8):
     
     # Geometric verification
     geom_scores = []
+    log_memory("process_search: before geom verification")
     for idx_local in rerank_subset:
         cand_path = IMAGES_DIR / IMAGE_PATHS[idx_local]
         geom_scores.append(_geom_score_cached(save_path, cand_path))
     geom_scores = np.array(geom_scores, dtype=np.float32)
+    log_memory("process_search: after geom verification")
     
     geom_rank = ranks_from_scores(geom_scores)
     GEOM_WEIGHT_LOCAL = min(GEOM_WEIGHT, 0.15)
