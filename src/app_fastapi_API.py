@@ -84,7 +84,26 @@ DESCR_CACHE: Dict[str, Tuple[List[cv2.KeyPoint], np.ndarray, bool]] = {}
 
 
 
+import gc, time, threading 
 
+EMBED_FILE_LOCK = threading.Lock()
+
+def _close_memmap(arr):
+    """Safely close a numpy.memmap so Windows will allow file replacement."""
+    try:
+        if isinstance(arr, np.memmap):
+            try:
+                arr.flush()
+            except Exception:
+                pass
+            mm = getattr(arr, '_mmap', None)
+            if mm is not None:
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def update_product_ids_json(product_ids_path, new_item):
@@ -302,58 +321,45 @@ def _geom_score_cached(query_path: Path, cand_path: Path) -> float:
         return 0.0
 
 def search(query_embed: np.ndarray, top_k: int = 8):
-    """V2-only search against precomputed embedding matrix"""
     if EMBED_V2 is None:
         raise RuntimeError('V2 embedding index not loaded')
     if query_embed.shape[0] != EMBED_V2.shape[1]:
         raise ValueError(f'Query dim {query_embed.shape[0]} != index dim {EMBED_V2.shape[1]}')
-    if FAISS_INDEX is not None:
-        sims, idxs = FAISS_INDEX.search(query_embed.reshape(1, -1).astype(np.float32), top_k * 5)
-        return idxs[0], sims[0]
-    sims = EMBED_V2 @ query_embed
-    order = np.argsort(-sims)[: top_k * 5]
-    return order, sims[order]
+    if FAISS_INDEX is None:
+        raise RuntimeError('FAISS index not available')
 
-def compute_fusion_similarities(query_embed: np.ndarray, candidate_pool: np.ndarray = None, comp_weights: Dict[str, float] = None):
-    """Compute fusion similarities for either the full index or a candidate pool."""
+    D, I = FAISS_INDEX.search(query_embed.reshape(1, -1).astype(np.float32), top_k * 5)
+    return I[0], D[0]
+
+def compute_fusion_similarities(query_embed, candidate_pool: np.ndarray, comp_weights=None):
     if comp_weights is None:
         comp_weights = {}
-    
-    if candidate_pool is None:
-        sims = np.zeros(EMBED_V2.shape[0], dtype=np.float32)
-        total_w = 0.0
-        for comp, rng in SPANS_V2.items():
-            w = float(comp_weights.get(comp, 0.0))
-            if w == 0.0:
-                continue
-            start, stop = int(rng[0]), int(rng[1])
-            q_sub = query_embed[start:stop]
-            emb_sub = EMBED_V2[:, start:stop]
-            sims += w * (emb_sub @ q_sub)
-            total_w += w
-        if total_w > 0:
-            sims /= total_w
-        cand_idx = np.argsort(-sims)
-        cand_scores = sims[cand_idx]
-        return cand_idx, cand_scores
-    else:
-        sims_pool = np.zeros(len(candidate_pool), dtype=np.float32)
-        total_w = 0.0
-        for comp, rng in SPANS_V2.items():
-            w = float(comp_weights.get(comp, 0.0))
-            if w == 0.0:
-                continue
-            start, stop = int(rng[0]), int(rng[1])
-            q_sub = query_embed[start:stop]
-            emb_sub = EMBED_V2[candidate_pool, start:stop]
-            sims_pool += w * (emb_sub @ q_sub)
-            total_w += w
-        if total_w > 0:
-            sims_pool /= total_w
-        order_pool = np.argsort(-sims_pool)
-        cand_idx = candidate_pool[order_pool]
-        cand_scores = sims_pool[order_pool]
-        return cand_idx, cand_scores
+    if candidate_pool is None or len(candidate_pool) == 0:
+        raise RuntimeError("candidate_pool is required to avoid full-matrix ops")
+
+    sims_pool = np.zeros(len(candidate_pool), dtype=np.float32)
+    total_w = 0.0
+    for comp, rng in SPANS_V2.items():
+        w = float(comp_weights.get(comp, 0.0))
+        if w == 0.0:
+            continue
+        si, sj = int(rng[0]), int(rng[1])
+        q_sub = query_embed[si:sj]
+
+        bs = 2048
+        for s in range(0, len(candidate_pool), bs):
+            e = min(s+bs, len(candidate_pool))
+            rows = EMBED_V2[candidate_pool[s:e], si:sj]
+            if rows.dtype != np.float32:
+                rows = rows.astype(np.float32, copy=False)
+            sims_pool[s:e] += w * (rows @ q_sub)
+        total_w += w
+
+    if total_w > 0:
+        sims_pool /= total_w
+    order_pool = np.argsort(-sims_pool)
+    return candidate_pool[order_pool], sims_pool[order_pool]
+
 
 def load_index():
     """Load v2 index (DINOv2 pipeline)."""
@@ -379,9 +385,8 @@ def load_index():
                     emb_path = INDEX_V2_JSON.parent / emb_path
                 if not emb_path.exists():
                     raise FileNotFoundError(f"Embedding file not found: {emb_path}")
-                EMBED_V2 = np.load(str(emb_path)).astype(np.float32)
-            elif 'embedding' in data:
-                EMBED_V2 = np.array(data['embedding'], dtype=np.float32)
+                EMBED_V2 = np.load(str(emb_path), mmap_mode='r')
+
             else:
                 raise RuntimeError("Index JSON missing embeddings (embedding_file / embedding_path / embedding)")
 
@@ -440,8 +445,44 @@ app = FastAPI(
     description="Image similarity search using DINOv2",
     lifespan=lifespan
 )
+from numpy.lib.format import open_memmap
+
+def append_row_to_embeddings_npy(vec: np.ndarray, emb_path: Path, retries: int = 30, delay: float = 0.05):
+    vec = np.asarray(vec, dtype=np.float32)
+    old = np.load(emb_path, mmap_mode='r')
+    n, d = old.shape
+    assert vec.shape == (d,), f"dim mismatch: {vec.shape} vs {(d,)}"
+    tmp = emb_path.with_suffix('.tmp.npy')
+    new = open_memmap(tmp, mode='w+', dtype=np.float32, shape=(n+1, d))
+
+    bs = max(1, 1_000_000 // d)
+    s = 0
+    while s < n:
+        e = min(s+bs, n)
+        new[s:e] = old[s:e]
+        s = e
+    new[n] = vec
 
 
+
+
+    _close_memmap(new)
+    _close_memmap(old)
+    del new, old
+    gc.collect()
+
+    for _ in range(retries):
+        try:
+            os.replace(tmp, emb_path)
+            return
+        except PermissionError:
+            time.sleep(delay)
+        except OSError as e:
+            if getattr(e, 'winerror', None) == 5:
+                time.sleep(delay)
+            else:
+                raise
+    os.replace(tmp, emb_path)
 
 def add_image_to_index(image_path: Path, object_id: str = None) -> bool:
     """Add a single image to the existing index without rebuilding."""
@@ -489,7 +530,28 @@ def add_image_to_index(image_path: Path, object_id: str = None) -> bool:
             object_id = f"img_{len(IMAGE_PATHS) + 1}_{int(time.time())}"
         
         # Add to in-memory structures
-        EMBED_V2 = np.vstack([EMBED_V2, new_embed.reshape(1, -1)])
+        with open(INDEX_V2_JSON, 'r', encoding='utf-8') as f:
+            meta = json.load(f)
+        emb_key = meta.get('embedding_file') or meta.get('embedding_path')
+        if not emb_key:
+            raise RuntimeError("index JSON missing embedding_path/embedding_file")
+
+
+        emb_path = Path(emb_key) if Path(emb_key).is_absolute() else INDEX_V2_JSON.parent / emb_key
+
+
+        with EMBED_FILE_LOCK:
+            _close_memmap(EMBED_V2)
+            EMBED_V2 = None
+            gc.collect()
+
+            append_row_to_embeddings_npy(new_embed, emb_path)
+
+            # Reload global memmap
+            EMBED_V2 = np.load(str(emb_path), mmap_mode='r')
+
+
+
         IMAGE_PATHS.append(str(image_path.relative_to(IMAGES_DIR)))
         IMAGE_IDS.append(object_id)
         
@@ -500,46 +562,20 @@ def add_image_to_index(image_path: Path, object_id: str = None) -> bool:
 
 
 
-        with open(INDEX_V2_JSON, 'r') as f:
-            index_data = json.load(f)
+        try:
+            with open(INDEX_V2_JSON, 'r', encoding='utf-8') as f:
+                index_data = json.load(f)
+        except Exception as e:
+            raise RuntimeError(f"Failed reading index JSON: {e}")
 
-        # Update the JSON index file
+
+        n, d = EMBED_V2.shape
         index_data['ids'] = IMAGE_IDS
         index_data['paths'] = IMAGE_PATHS
+        index_data['embedding_shape'] = [int(n), int(d)]
 
-        # Determine how embeddings are stored and update accordingly
-        emb_file = index_data.get('embedding_file') or index_data.get('embedding_path')
-        try:
-            def _is_rel_to(p: Path, base: Path) -> bool:
-                try:
-                    p.relative_to(base)
-                    return True
-                except Exception:
-                    return False
-            if emb_file:
-                emb_path = Path(emb_file)
-                if not emb_path.is_absolute():
-                    emb_path = INDEX_V2_JSON.parent / emb_path
-                emb_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path = emb_path.with_suffix('.tmp.npy')
-                np.save(str(tmp_path), EMBED_V2.astype(np.float32))
-                os.replace(str(tmp_path), str(emb_path))
-                # Normalize key usage: preserve whichever key existed
-                rel_or_abs = str(emb_path.relative_to(INDEX_V2_JSON.parent)) if _is_rel_to(emb_path, INDEX_V2_JSON.parent) else str(emb_path)
-                if 'embedding_file' in index_data:
-                    index_data['embedding_file'] = rel_or_abs
-                elif 'embedding_path' in index_data:
-                    index_data['embedding_path'] = rel_or_abs
-            else:
-                index_data['embedding'] = EMBED_V2.tolist()
-        except Exception as e:
-            print(f"[ERROR] Failed writing embedding file: {e}. Falling back to inline.")
-            index_data['embedding'] = EMBED_V2.tolist()
-        
-        with open(INDEX_V2_JSON, 'w') as f:
-            json.dump(index_data, f)
-        
-
+        with open(INDEX_V2_JSON, 'w', encoding='utf-8') as f:
+           json.dump(index_data, f, ensure_ascii=False, indent=2)
 
 
         # Update FAISS index file if available
@@ -644,9 +680,8 @@ def process_search(save_path: Path, color_filter: str = None, top_k: int = 8):
             cand_idx = cand_idx_all[: max(8, rerank_k_local)]
             cand_scores = cand_scores_all[: max(8, rerank_k_local)]
         else:
-            sims = EMBED_V2 @ query_embed
-            cand_idx = np.argsort(-sims)[: max(8, rerank_k_local)]
-            cand_scores = sims[cand_idx]
+            I2, D2 = search(query_embed, top_k=max(8, rerank_k_local))
+            cand_idx, cand_scores = I2, D2
     
     rerank_subset = cand_idx[:rerank_k_local]
     base_subset = cand_scores[:len(rerank_subset)].astype(np.float32)
@@ -817,8 +852,14 @@ async def add_image_to_index_endpoint(
 
 
 def _persist_index_changes():
-    """Persist current in-memory index state (EMBED_V2, IMAGE_IDS, IMAGE_PATHS) to disk."""
+    """
+    Persist lightweight metadata (ids/paths/shape) and rebuild FAISS from the
+    on-disk memmap **in chunks** to avoid huge RAM spikes. Does NOT rewrite
+    the embeddings .npy file and NEVER inlines embeddings into JSON.
+    """
     global EMBED_V2, IMAGE_IDS, IMAGE_PATHS, FAISS_INDEX
+
+    # ---- 1) Load & update JSON metadata (no embedding payloads) ----
     try:
         with open(INDEX_V2_JSON, 'r') as f:
             index_data = json.load(f)
@@ -829,50 +870,103 @@ def _persist_index_changes():
     index_data['paths'] = IMAGE_PATHS
 
     emb_file = index_data.get('embedding_file') or index_data.get('embedding_path')
-    try:
-        def _is_rel_to(p: Path, base: Path) -> bool:
-            try:
-                p.relative_to(base)
-                return True
-            except Exception:
-                return False
-        if emb_file:
-            emb_path = Path(emb_file)
-            if not emb_path.is_absolute():
-                emb_path = INDEX_V2_JSON.parent / emb_path
-            emb_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp_path = emb_path.with_suffix('.tmp.npy')
-            np.save(str(tmp_path), EMBED_V2.astype(np.float32))
-            os.replace(str(tmp_path), str(emb_path))
-            rel_or_abs = str(emb_path.relative_to(INDEX_V2_JSON.parent)) if _is_rel_to(emb_path, INDEX_V2_JSON.parent) else str(emb_path)
-            if 'embedding_file' in index_data:
-                index_data['embedding_file'] = rel_or_abs
-            elif 'embedding_path' in index_data:
-                index_data['embedding_path'] = rel_or_abs
-        else:
-            index_data['embedding'] = EMBED_V2.tolist()
-    except Exception as e:
-        # Fall back to inline
-        index_data['embedding'] = EMBED_V2.tolist()
-        print(f"[WARN] Persist fallback to inline embeddings: {e}")
+    if not emb_file:
+        raise RuntimeError(
+            "Index JSON missing 'embedding_path'/'embedding_file'. "
+            "Refuse to inline embeddings; set a file path instead."
+        )
+
+    # ensure path is stored relative to index JSON if possible (keeps repo portable)
+    emb_path = Path(emb_file)
+    if not emb_path.is_absolute():
+        emb_path = INDEX_V2_JSON.parent / emb_path
+
+    # reflect current shape/dtype from the memmap we already have
+    n, d = int(EMBED_V2.shape[0]), int(EMBED_V2.shape[1])
+    index_data['embedding_shape'] = [n, d]
+    index_data['embedding_dtype'] = str(EMBED_V2.dtype)
+
+    # normalize path storage (relative if under same dir)
+    def _is_rel_to(p: Path, base: Path) -> bool:
+        try:
+            p.relative_to(base); return True
+        except Exception:
+            return False
+    rel_or_abs = (
+        str(emb_path.relative_to(INDEX_V2_JSON.parent))
+        if _is_rel_to(emb_path, INDEX_V2_JSON.parent) else str(emb_path)
+    )
+    if 'embedding_file' in index_data:
+        index_data['embedding_file'] = rel_or_abs
+    elif 'embedding_path' in index_data:
+        index_data['embedding_path'] = rel_or_abs
 
     with open(INDEX_V2_JSON, 'w') as f:
-        json.dump(index_data, f)
+        json.dump(index_data, f, ensure_ascii=False, indent=2)
 
-    # Rebuild FAISS index (simple FlatIP) if faiss available
+    # ---- 2) Rebuild FAISS from memmap in blocks (no giant cast/copy) ----
     if HAVE_FAISS:
         try:
-            dim = EMBED_V2.shape[1]
-            # Use inner product if metric=IP present, else default IP
-            if FAISS_INDEX is not None and hasattr(FAISS_INDEX, 'ntotal') and FAISS_INDEX.ntotal == 0:
-                pass
-            FAISS_INDEX_NEW = faiss.IndexFlatIP(dim)  # type: ignore
-            FAISS_INDEX_NEW.add(EMBED_V2.astype(np.float32))
+            metric = (index_data.get('metric') or 'IP').upper()
+            if metric == 'L2':
+                FAISS_INDEX_NEW = faiss.IndexFlatL2(d)  # type: ignore
+            else:
+                FAISS_INDEX_NEW = faiss.IndexFlatIP(d)  # type: ignore
+
+            bs = 8192  # rows per block; tune for your I/O
+            # Add in chunks; upcast each chunk only (keeps RAM flat)
+            for s in range(0, n, bs):
+                e = min(s + bs, n)
+                block = EMBED_V2[s:e]
+                if block.dtype != np.float32:
+                    block = block.astype(np.float32, copy=False)
+                FAISS_INDEX_NEW.add(block)
+
+            # persist and swap in
             faiss.write_index(FAISS_INDEX_NEW, str(INDEX_V2_FAISS))  # type: ignore
-            FAISS_INDEX = FAISS_INDEX_NEW  # reassign
+            FAISS_INDEX = FAISS_INDEX_NEW
+
         except Exception as e:
             print(f"[WARN] Failed to rebuild FAISS index: {e}")
 
+def rewrite_without_rows(emb_path: Path, remove_idx_sorted_desc: List[int], retries: int = 30, delay: float = 0.05):
+    old = np.load(emb_path, mmap_mode='r')
+    n, d = old.shape
+    keep_mask = np.ones(n, dtype=bool)
+    keep_mask[remove_idx_sorted_desc] = False
+    new_n = int(keep_mask.sum())
+
+    tmp = emb_path.with_suffix('.tmp.npy')
+    new = open_memmap(tmp, mode='w+', dtype=old.dtype, shape=(new_n, d))
+
+    bs = max(1, 1_000_000 // d)
+    w = 0
+    for s in range(0, n, bs):
+        e = min(s+bs, n)
+        block = old[s:e]
+        km = keep_mask[s:e]
+        kc = int(km.sum())
+        if kc:
+            new[w:w+kc] = block[km]
+            w += kc
+
+    _close_memmap(new)
+    _close_memmap(old)
+    del new, old
+    gc.collect()
+
+    for _ in range(retries):
+        try:
+            os.replace(tmp, emb_path)
+            return
+        except PermissionError:
+            time.sleep(delay)
+        except OSError as e:
+            if getattr(e, 'winerror', None) == 5:
+                time.sleep(delay)
+            else:
+                raise
+    os.replace(tmp, emb_path)
 
 @app.post("/api/remove-from-index")
 async def remove_from_index(
@@ -951,7 +1045,21 @@ async def remove_from_index(
         # Remove from embeddings / metadata
         if all_remove_indices:
             all_remove_indices_sorted = sorted(all_remove_indices, reverse=True)
-            EMBED_V2 = np.delete(EMBED_V2, all_remove_indices_sorted, axis=0)
+
+            emb_file = json.load(open(INDEX_V2_JSON)).get('embedding_file') \
+                    or json.load(open(INDEX_V2_JSON)).get('embedding_path')
+            emb_path = Path(emb_file) if Path(emb_file).is_absolute() else INDEX_V2_JSON.parent / emb_file
+
+
+            with EMBED_FILE_LOCK:
+                _close_memmap(EMBED_V2)
+                EMBED_V2 = None
+                gc.collect()
+
+                rewrite_without_rows(emb_path, all_remove_indices_sorted)
+
+                EMBED_V2 = np.load(str(emb_path), mmap_mode='r')
+
             for idx in all_remove_indices_sorted:
                 del IMAGE_PATHS[idx]
                 del IMAGE_IDS[idx]
